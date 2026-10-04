@@ -124,14 +124,16 @@ public class ClearingController {
 
     public record SimulateRequest(LocalDate valuationDate,
                                   List<String> agreementCodes,
-                                  String note) {
+                                  String note,
+                                  List<BatchService.DeferralRequest> deferrals) {
     }
 
     @PostMapping("/batches/simulate")
     @ResponseStatus(HttpStatus.CREATED)
     public Map<String, Object> simulate(@Valid @RequestBody SimulateRequest request) {
         NettingBatch batch = batchService.simulate(new SimulationRequest(
-                request.valuationDate(), request.agreementCodes(), request.note()));
+                request.valuationDate(), request.agreementCodes(), request.note(),
+                request.deferrals()));
         return toBatchJson(batchService.getBatch(batch.getId()));
     }
 

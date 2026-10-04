@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
-import { Agreement, Batch, Claim, FxRate, LegalEntity } from './models';
+import { Agreement, Batch, Claim, DeferralInput, FxRate, LegalEntity } from './models';
 
 @Injectable({ providedIn: 'root' })
 export class ClearingApiService {
@@ -27,9 +27,10 @@ export class ClearingApiService {
   getBatch(id: string): Observable<Batch> {
     return this.http.get<Batch>(`${this.base}/batches/${id}`);
   }
-  simulate(valuationDate: string, agreementCodes: string[], note: string): Observable<Batch> {
+  simulate(valuationDate: string, agreementCodes: string[], note: string,
+           deferrals: DeferralInput[]): Observable<Batch> {
     return this.http.post<Batch>(`${this.base}/batches/simulate`, {
-      valuationDate, agreementCodes, note,
+      valuationDate, agreementCodes, note, deferrals,
     });
   }
   confirm(id: string): Observable<Batch> {

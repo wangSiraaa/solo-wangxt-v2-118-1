@@ -29,7 +29,7 @@ import { SelectedEdge } from './debt-graph.component';
       </div>
 
       <div class="reason" *ngIf="edge.reasonCode">
-        <b class="bad">排除原因：{{ edge.reasonCode }}</b>
+        <b class="bad">排除原因：{{ edge.reasonCode }}<span *ngIf="reasonText">（{{ reasonText }}）</span></b>
         <div class="muted">{{ edge.reasonDetail }}</div>
       </div>
 
@@ -109,6 +109,20 @@ export class TracePanelComponent {
       original: '保留的原始债务（未抵销）',
       excluded: '被排除债权',
     }[this.edge?.kind ?? 'cash'];
+  }
+
+  get reasonText(): string {
+    return {
+      DEFERRED: '本次暂缓，仅本批次生效',
+      PLEDGED: '已质押',
+      DISPUTED: '存在争议',
+      NOT_OPEN: '非开放状态',
+      NOT_MEMBER_PAIR: '非协议成员',
+      CCY_NOT_ALLOWED: '币种超范围',
+      CROSS_CCY_NOT_ALLOWED: '禁止跨币种',
+      FX_RATE_MISSING: '缺少汇率',
+      SELF_DEBT: '自我债务',
+    }[this.edge?.reasonCode ?? ''] ?? '';
   }
 
   money(v: number): string {

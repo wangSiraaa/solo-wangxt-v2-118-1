@@ -69,6 +69,12 @@ export interface Exclusion {
   reasonDetail: string;
 }
 
+/** One claim held back for a single simulation run, with the mandatory reason. */
+export interface DeferralInput {
+  claimId: string;
+  reason: string;
+}
+
 export interface BatchLeg {
   id: string;
   payerCode: string;

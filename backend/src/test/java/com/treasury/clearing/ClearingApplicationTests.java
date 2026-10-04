@@ -2,6 +2,11 @@ package com.treasury.clearing;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.treasury.clearing.domain.Claim;
+import com.treasury.clearing.domain.ClaimStatus;
+import com.treasury.clearing.domain.NettingAgreement;
+import com.treasury.clearing.repo.ClaimRepository;
+import com.treasury.clearing.repo.NettingAgreementRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -13,7 +18,10 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import java.util.List;
 
 /**
  * Full-stack acceptance on the seeded dataset:
@@ -29,6 +37,10 @@ class ClearingApplicationTests {
 
     @Autowired
     private MockMvc mockMvc;
+    @Autowired
+    private NettingAgreementRepository agreementRepository;
+    @Autowired
+    private ClaimRepository claimRepository;
     private final ObjectMapper json = new ObjectMapper();
 
     @Test
@@ -128,24 +140,166 @@ class ClearingApplicationTests {
                 .andExpect(status().isConflict());
     }
 
+    /**
+     * Per-batch deferral: treasury holds back one open invoice whose paperwork is not
+     * finished. The batch lists it as a DEFERRED exclusion with the reason; amounts,
+     * payment legs and invoice tracing are computed from the remaining claims only.
+     * The claim row is never modified, so the next run without the selection includes
+     * it again. Uses its own agreement so it is independent of the seeded scenario
+     * regardless of test order.
+     */
+    @Test
+    void deferralScenario() throws Exception {
+        seedDeferralFixture();
+
+        // 1) Defer one open invoice of the test ring, with a reason.
+        JsonNode sim = simulate(LocalDate.of(2026, 9, 30), List.of("NA-TST"),
+                List.<String[]>of(new String[]{"CLM-TST-001", "凭证未办妥，本次暂缓"}));
+        JsonNode g = group(sim, "NA-TST");
+        assertThat(g.get("originalLegCount").asInt()).isEqualTo(2);
+        assertThat(g.get("grossAmount").decimalValue()).isEqualByComparingTo("1000.00");
+        assertThat(g.get("netAmount").decimalValue()).isEqualByComparingTo("600.00");
+        // Explicit exclusion record carrying the deferral reason.
+        assertThat(g.get("exclusions").size()).isEqualTo(1);
+        JsonNode ex = g.get("exclusions").get(0);
+        assertThat(ex.get("claimId").asText()).isEqualTo("CLM-TST-001");
+        assertThat(ex.get("invoiceNo").asText()).isEqualTo("INV-TST-001");
+        assertThat(ex.get("reasonCode").asText()).isEqualTo("DEFERRED");
+        assertThat(ex.get("reasonDetail").asText()).isEqualTo("凭证未办妥，本次暂缓");
+        // Legs recompute from the remaining claims: B pays A 400 and C 200.
+        assertThat(cashLegs(g)).isEqualTo(2);
+        assertThat(cashAmount(g, "B", "A")).isEqualByComparingTo("400.00");
+        assertThat(cashAmount(g, "B", "C")).isEqualByComparingTo("200.00");
+        // The deferred invoice is traced by no leg at all.
+        assertThat(legInvoices(g)).doesNotContain("INV-TST-001");
+
+        // The claim row itself is untouched by the deferral.
+        JsonNode claimsAfterSim = claims();
+        assertThat(findClaim(claimsAfterSim, "CLM-TST-001").get("status").asText()).isEqualTo("OPEN");
+        assertThat(findClaim(claimsAfterSim, "CLM-TST-001").get("offsetBatchId").asText()).isEmpty();
+
+        // 2) A fresh simulation without the selection lets the invoice re-enter the pool.
+        JsonNode sim2 = simulate(LocalDate.of(2026, 9, 30), List.of("NA-TST"), List.of());
+        JsonNode g2 = group(sim2, "NA-TST");
+        assertThat(g2.get("exclusions").size()).isEqualTo(0);
+        assertThat(g2.get("originalLegCount").asInt()).isEqualTo(3);
+        assertThat(g2.get("grossAmount").decimalValue()).isEqualByComparingTo("2000.00");
+        assertThat(g2.get("netAmount").decimalValue()).isEqualByComparingTo("600.00");
+        assertThat(legInvoices(g2)).contains("INV-TST-001");
+
+        // 3) Confirming the deferral batch settles only the claims it actually netted;
+        //    the deferred claim stays open and carries no batch reference.
+        postJson("/api/batches/" + sim.get("id").asText() + "/confirm");
+        JsonNode claimsAfterConfirm = claims();
+        assertThat(findClaim(claimsAfterConfirm, "CLM-TST-001").get("status").asText()).isEqualTo("OPEN");
+        assertThat(findClaim(claimsAfterConfirm, "CLM-TST-001").get("offsetBatchId").asText()).isEmpty();
+        assertThat(findClaim(claimsAfterConfirm, "CLM-TST-002").get("status").asText()).isEqualTo("SETTLED");
+
+        // 4) Unknown claim ids, cross-agreement selections and blank reasons are
+        //    rejected with 409 and leave no misleading batch behind.
+        int batchesBefore = batchCount();
+        simulateExpectConflict(List.of("NA-TST"), List.<String[]>of(new String[]{"NO-SUCH-CLAIM", "x"}));
+        simulateExpectConflict(List.of("NA-TST"), List.<String[]>of(new String[]{"CLM-R1-001", "cross-agreement"}));
+        simulateExpectConflict(List.of("NA-TST"), List.<String[]>of(new String[]{"CLM-TST-001", "  "}));
+        assertThat(batchCount()).isEqualTo(batchesBefore);
+    }
+
+    private void seedDeferralFixture() {
+        NettingAgreement agr = new NettingAgreement("NA-TST", "暂缓功能测试协议", true, false,
+                "CNY", "A", LocalDate.of(2026, 1, 1), null, null, null);
+        agr.addMember("A");
+        agr.addMember("B");
+        agr.addMember("C");
+        agr.addCurrency("CNY");
+        agreementRepository.save(agr);
+        claimRepository.save(new Claim("CLM-TST-001", "INV-TST-001", "NA-TST", "A", "B",
+                new BigDecimal("1000.00"), "CNY", ClaimStatus.OPEN,
+                LocalDate.of(2026, 9, 10), LocalDate.of(2026, 10, 10), "暂缓测试：甲欠乙"));
+        claimRepository.save(new Claim("CLM-TST-002", "INV-TST-002", "NA-TST", "B", "C",
+                new BigDecimal("600.00"), "CNY", ClaimStatus.OPEN,
+                LocalDate.of(2026, 9, 12), LocalDate.of(2026, 10, 12), "暂缓测试：乙欠丙"));
+        claimRepository.save(new Claim("CLM-TST-003", "INV-TST-003", "NA-TST", "C", "A",
+                new BigDecimal("400.00"), "CNY", ClaimStatus.OPEN,
+                LocalDate.of(2026, 9, 15), LocalDate.of(2026, 10, 15), "暂缓测试：丙欠甲"));
+    }
+
+    private JsonNode simulate(LocalDate date, List<String> agreementCodes,
+                              List<String[]> deferrals) throws Exception {
+        var req = json.createObjectNode().put("valuationDate", date.toString());
+        var codes = req.putArray("agreementCodes");
+        agreementCodes.forEach(codes::add);
+        var defs = req.putArray("deferrals");
+        for (String[] d : deferrals) {
+            defs.addObject().put("claimId", d[0]).put("reason", d[1]);
+        }
+        return json.readTree(mockMvc.perform(post("/api/batches/simulate")
+                        .contentType("application/json")
+                        .content(json.writeValueAsString(req)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    private void simulateExpectConflict(List<String> agreementCodes, List<String[]> deferrals)
+            throws Exception {
+        var req = json.createObjectNode().put("valuationDate", "2026-09-30");
+        var codes = req.putArray("agreementCodes");
+        agreementCodes.forEach(codes::add);
+        var defs = req.putArray("deferrals");
+        for (String[] d : deferrals) {
+            defs.addObject().put("claimId", d[0]).put("reason", d[1]);
+        }
+        mockMvc.perform(post("/api/batches/simulate")
+                        .contentType("application/json")
+                        .content(json.writeValueAsString(req)))
+                .andExpect(status().isConflict());
+    }
+
+    private int batchCount() throws Exception {
+        return json.readTree(mockMvc.perform(get("/api/batches"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8)).size();
+    }
+
+    private java.math.BigDecimal cashAmount(JsonNode g, String payer, String receiver) {
+        java.math.BigDecimal sum = java.math.BigDecimal.ZERO;
+        for (JsonNode leg : g.get("legs")) {
+            if (leg.get("amount").asDouble() > 0
+                    && leg.get("payerCode").asText().equals(payer)
+                    && leg.get("receiverCode").asText().equals(receiver)) {
+                sum = sum.add(leg.get("amount").decimalValue());
+            }
+        }
+        return sum;
+    }
+
+    private java.util.Set<String> legInvoices(JsonNode g) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (JsonNode leg : g.get("legs")) {
+            for (JsonNode it : leg.get("items")) {
+                out.add(it.get("invoiceNo").asText());
+            }
+        }
+        return out;
+    }
+
     private JsonNode simulate(LocalDate date) throws Exception {
         var req = json.createObjectNode().put("valuationDate", date.toString());
         return json.readTree(mockMvc.perform(post("/api/batches/simulate")
                         .contentType("application/json")
                         .content(json.writeValueAsString(req)))
                 .andExpect(status().isCreated())
-                .andReturn().getResponse().getContentAsString());
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8));
     }
 
     private JsonNode postJson(String path) throws Exception {
         return json.readTree(mockMvc.perform(post(path))
                 .andExpect(status().isOk())
-                .andReturn().getResponse().getContentAsString());
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8));
     }
 
     private JsonNode claims() throws Exception {
         return json.readTree(mockMvc.perform(get("/api/claims"))
-                .andReturn().getResponse().getContentAsString());
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8));
     }
 
     private JsonNode group(JsonNode batch, String agreementCode) {

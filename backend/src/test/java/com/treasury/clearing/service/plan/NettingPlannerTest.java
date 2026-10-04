@@ -313,4 +313,84 @@ class NettingPlannerTest {
         assertThat(g.exclusions()).extracting(PlannedExclusion::reasonCode)
                 .containsExactly("FX_RATE_MISSING");
     }
+
+    // ------------------------------------------------------------------
+    // Deferral: treasury holds a claim back for one batch. It becomes a
+    // DEFERRED exclusion with the given reason; positions, legs and invoice
+    // tracing are computed from the remaining claims only.
+    // ------------------------------------------------------------------
+    @Test
+    void deferredClaimIsExcludedWithReasonAndRingNetsWithoutIt() {
+        PlannedGroup g = NettingPlanner.plan(
+                spec(true, false, "A", "B", "C"),
+                List.of(
+                        claim("c1", "A", "B", "1000.00"),
+                        claim("c2", "B", "C", "600.00"),
+                        claim("c3", "C", "A", "400.00")),
+                "CNY", GroupMode.NET_SAME_CURRENCY,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("c1", "paperwork not finished"));
+
+        assertThat(g.exclusions()).hasSize(1);
+        PlannedExclusion ex = g.exclusions().get(0);
+        assertThat(ex.claimId()).isEqualTo("c1");
+        assertThat(ex.invoiceNo()).isEqualTo("INV-c1");
+        assertThat(ex.reasonCode()).isEqualTo("DEFERRED");
+        assertThat(ex.reasonDetail()).isEqualTo("paperwork not finished");
+        // Without c1: B pays 600 net; A receives 400, C receives 200.
+        assertThat(cashLegCount(g)).isEqualTo(2);
+        assertThat(cashAmount(g, "B", "A")).isEqualByComparingTo("400.00");
+        assertThat(cashAmount(g, "B", "C")).isEqualByComparingTo("200.00");
+        assertThat(g.grossAmount()).isEqualByComparingTo("1000.00");
+        assertThat(g.netAmount()).isEqualByComparingTo("600.00");
+        // The deferred claim is traced by no leg item at all.
+        assertThat(g.legs()).allMatch(l -> l.items().stream()
+                .noneMatch(it -> it.claimId().equals("c1")));
+    }
+
+    @Test
+    void deferredClaimUnderPassThroughIsNotPreservedAsOriginalDebt() {
+        PlannedGroup g = NettingPlanner.plan(
+                spec(false, false, "A", "B", "C"),
+                List.of(
+                        claim("c1", "A", "B", "500.00"),
+                        claim("c2", "B", "C", "500.00"),
+                        claim("c3", "C", "A", "500.00")),
+                "CNY", GroupMode.PASS_THROUGH,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("c2", "hold for this batch"));
+
+        // The two remaining debts survive 1:1; the deferred one is only an exclusion.
+        assertThat(g.legs()).hasSize(2);
+        assertThat(g.legs()).allMatch(PlannedLeg::original);
+        assertThat(g.legs()).allMatch(l -> l.items().stream()
+                .noneMatch(it -> it.claimId().equals("c2")));
+        assertThat(g.exclusions()).extracting(PlannedExclusion::reasonCode)
+                .containsExactly("DEFERRED");
+        assertThat(g.grossAmount()).isEqualByComparingTo("1000.00");
+    }
+
+    @Test
+    void deferralIsRecordedOnlyInThePocketThatHandlesTheClaim() {
+        // Same-currency agreement with two currency pockets: the deferred USD claim
+        // is DEFERRED in the USD pocket and stays CROSS_CCY_NOT_ALLOWED in the CNY one.
+        PlannedGroup cny = NettingPlanner.plan(
+                spec(true, false, "A", "B"),
+                List.of(claim("u1", "A", "B", "10.00", "USD", ClaimStatus.OPEN)),
+                "CNY", GroupMode.NET_SAME_CURRENCY, fixedFx(Map.of()),
+                OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("u1", "hold"));
+        assertThat(cny.exclusions()).extracting(PlannedExclusion::reasonCode)
+                .containsExactly("CROSS_CCY_NOT_ALLOWED");
+
+        PlannedGroup usd = NettingPlanner.plan(
+                spec(true, false, "A", "B"),
+                List.of(claim("u1", "A", "B", "10.00", "USD", ClaimStatus.OPEN)),
+                "USD", GroupMode.NET_SAME_CURRENCY, fixedFx(Map.of()),
+                OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("u1", "hold"));
+        assertThat(usd.exclusions()).extracting(PlannedExclusion::reasonCode)
+                .containsExactly("DEFERRED");
+        assertThat(usd.legs()).isEmpty();
+    }
 }

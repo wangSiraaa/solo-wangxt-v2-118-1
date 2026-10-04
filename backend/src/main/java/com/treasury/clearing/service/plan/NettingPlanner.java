@@ -87,6 +87,24 @@ public final class NettingPlanner {
                                     FxRateProvider fxProvider,
                                     OffsetDateTime fxAsOf,
                                     BigDecimal fxMargin) {
+        return plan(spec, claims, groupCurrency, mode, fxProvider, fxAsOf, fxMargin, Map.of());
+    }
+
+    /**
+     * @param deferrals claimId -> treasury reason for holding the claim back this run.
+     *                  A deferral is a per-batch input only: the claim is recorded as a
+     *                  DEFERRED exclusion and left out of every leg, but its master row
+     *                  is never touched, so it re-enters the pool in the next simulation
+     *                  unless selected again.
+     */
+    public static PlannedGroup plan(AgreementSpec spec,
+                                    List<PlannerClaim> claims,
+                                    String groupCurrency,
+                                    GroupMode mode,
+                                    FxRateProvider fxProvider,
+                                    OffsetDateTime fxAsOf,
+                                    BigDecimal fxMargin,
+                                    Map<String, String> deferrals) {
         boolean passThrough = mode == GroupMode.PASS_THROUGH;
 
         List<PlannedExclusion> exclusions = new ArrayList<>();
@@ -102,6 +120,15 @@ public final class NettingPlanner {
                 .toList();
 
         for (PlannerClaim c : ordered) {
+            String deferReason = deferrals.get(c.id());
+            if (deferReason != null && handledByPocket(c, groupCurrency, mode)) {
+                // Held back by treasury for this batch only: excluded with the given
+                // reason, contributes no slice, and stays untouched in the claim table.
+                // Recorded only in the pocket that would otherwise handle the claim;
+                // in sibling currency pockets the usual CROSS_CCY_NOT_ALLOWED applies.
+                exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), "DEFERRED", deferReason));
+                continue;
+            }
             String reason = exclusionReason(spec, c, groupCurrency, mode);
             if (reason != null) {
                 exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), reason,
@@ -427,6 +454,11 @@ public final class NettingPlanner {
                 spec.roundingBearerCode(), legs, exclusions, originalLegCount, gross, gross,
                 BigDecimal.ZERO.setScale(EXACT_SCALE, RM), BigDecimal.ZERO.setScale(MONEY_SCALE, RM),
                 Map.of(), Map.of());
+    }
+
+    /** True when this pocket is the one that would net (or pass through) the claim. */
+    private static boolean handledByPocket(PlannerClaim c, String groupCurrency, GroupMode mode) {
+        return mode == GroupMode.NET_CROSS_CURRENCY || c.currency().equals(groupCurrency);
     }
 
     private static String exclusionReason(AgreementSpec spec, PlannerClaim c, String groupCurrency,

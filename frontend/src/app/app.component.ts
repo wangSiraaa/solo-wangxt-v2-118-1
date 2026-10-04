@@ -2,7 +2,7 @@ import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ClearingApiService } from './api.service';
-import { Agreement, Batch, BatchGroup, Claim, LegalEntity } from './models';
+import { Agreement, Batch, BatchGroup, Claim, DeferralInput, LegalEntity } from './models';
 import { DebtGraphComponent, SelectedEdge } from './components/debt-graph.component';
 import { TracePanelComponent } from './components/trace-panel.component';
 import { BatchSummaryComponent } from './components/batch-summary.component';
@@ -51,6 +51,30 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
           跨币种 {{ a.crossCurrency ? '允许（结算 ' + a.settlementCurrency + '）' : '不允许' }}；
           尾差承担人 {{ a.roundingBearerCode || '—' }}。
         </div>
+
+        <!-- 本次暂缓：仅本批次生效，不改动债权状态 -->
+        <div class="defer-panel" *ngIf="deferrableClaims().length">
+          <div class="defer-head">
+            本次暂缓（凭证未办妥的债权可暂不纳入；仅对本批次生效，不改动债权状态，
+            下次试算不勾选即自动入池）<span *ngIf="deferChecked.size">——已选 {{ deferChecked.size }} 笔</span>
+          </div>
+          <div class="defer-list">
+            <div class="defer-row" *ngFor="let c of deferrableClaims()">
+              <label>
+                <input type="checkbox" [checked]="deferChecked.has(c.id)"
+                       (change)="toggleDefer(c.id, $any($event.target).checked)">
+                <span class="mono">{{ c.invoiceNo }}</span>
+                <span class="muted">
+                  {{ c.agreementCode }} · {{ c.debtorCode }}→{{ c.creditorCode }} ·
+                  {{ money(c.amount) }} {{ c.currency }}
+                </span>
+              </label>
+              <input *ngIf="deferChecked.has(c.id)" class="reason"
+                     placeholder="暂缓原因（必填）" [(ngModel)]="deferReasons[c.id]">
+            </div>
+          </div>
+        </div>
+        <div class="error" *ngIf="errorMessage">⚠ {{ errorMessage }}</div>
       </section>
 
       <!-- ---------------- 批次列表 ---------------- -->
@@ -157,13 +181,15 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
             <h3 class="bad">排除的债权（不参与本次清算）</h3>
             <table>
               <thead>
-              <tr><th>发票</th><th>债权</th><th>原因码</th><th>说明</th></tr>
+              <tr><th>发票</th><th>债权</th><th>原因</th><th>说明</th></tr>
               </thead>
               <tbody>
               <tr *ngFor="let ex of g.exclusions">
                 <td>{{ ex.invoiceNo }}</td>
                 <td>{{ ex.claimId }}</td>
-                <td><span class="tag DISPUTED">{{ ex.reasonCode }}</span></td>
+                <td><span class="tag" [class]="ex.reasonCode" [title]="ex.reasonCode">
+                  {{ reasonText(ex.reasonCode) }}
+                </span></td>
                 <td class="muted">{{ ex.reasonDetail }}</td>
               </tr>
               </tbody>
@@ -197,6 +223,7 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
     .tag.SIMULATED { color: var(--accent); border-color: var(--accent); }
     .tag.CONFIRMED { color: var(--good); border-color: var(--good); }
     .tag.PAID_SIMULATED { color: var(--warn); border-color: var(--warn); }
+    .tag.DEFERRED { color: var(--warn); border-color: var(--warn); }
     .tag.NET { color: #7dd3fc; border-color: #38bdf8; }
     .tag.PASS { color: #cbd5e1; border-color: #94a3b8; }
     .tag.CASH { color: #7dd3fc; border-color: #38bdf8; }
@@ -204,6 +231,14 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
     .tag.LEGORIG { color: #cbd5e1; border-color: #94a3b8; }
     .bad { color: var(--bad); }
     .foot { margin-top: 20px; }
+    .defer-panel { margin-top: 10px; border: 1px dashed var(--line); border-radius: 8px; padding: 8px 12px; }
+    .defer-head { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .defer-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+    .defer-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .defer-row label { display: flex; gap: 8px; align-items: center; font-size: 12.5px; }
+    .defer-row .mono { font-variant-numeric: tabular-nums; }
+    .defer-row .reason { width: 260px; padding: 3px 8px; font-size: 12px; }
+    .error { margin-top: 8px; color: var(--bad); font-size: 12.5px; }
   `],
 })
 export class AppComponent implements OnInit {
@@ -217,6 +252,11 @@ export class AppComponent implements OnInit {
   note = '';
   loading = false;
   busy = false;
+  errorMessage = '';
+
+  /** Per-batch deferral picker state: checked claim ids and their reasons. */
+  deferChecked = new Set<string>();
+  deferReasons: Record<string, string> = {};
 
   current: Batch | null = null;
   activeGroupId = '';
@@ -237,6 +277,27 @@ export class AppComponent implements OnInit {
 
   onAgreementChange(): void {
     this.selectedEdge = null;
+    this.errorMessage = '';
+    // Deferral selections belong to the previously shown agreement scope.
+    this.deferChecked.clear();
+    this.deferReasons = {};
+  }
+
+  /** Open claims inside the current simulation scope that may be deferred this run. */
+  deferrableClaims(): Claim[] {
+    return this.claims.filter(
+      (c) => c.status === 'OPEN'
+        && (!this.selectedAgreement || c.agreementCode === this.selectedAgreement),
+    );
+  }
+
+  toggleDefer(claimId: string, checked: boolean): void {
+    if (checked) {
+      this.deferChecked.add(claimId);
+    } else {
+      this.deferChecked.delete(claimId);
+      delete this.deferReasons[claimId];
+    }
   }
 
   get activeGroup(): BatchGroup | null {
@@ -251,15 +312,31 @@ export class AppComponent implements OnInit {
   }
 
   runSimulation(): void {
+    this.errorMessage = '';
+    const deferrals: DeferralInput[] = [];
+    for (const id of this.deferChecked) {
+      const reason = (this.deferReasons[id] ?? '').trim();
+      if (!reason) {
+        this.errorMessage = '请为每笔暂缓债权填写暂缓原因。';
+        return;
+      }
+      deferrals.push({ claimId: id, reason });
+    }
     this.loading = true;
     const codes = this.selectedAgreement ? [this.selectedAgreement] : [];
-    this.api.simulate(this.valuationDate, codes, this.note).subscribe({
+    this.api.simulate(this.valuationDate, codes, this.note, deferrals).subscribe({
       next: (b) => {
         this.loading = false;
+        // The deferral applied to this batch only; reset the picker.
+        this.deferChecked.clear();
+        this.deferReasons = {};
         this.batches = [b, ...this.batches];
         this.openBatch(b.id);
       },
-      error: () => (this.loading = false),
+      error: (err) => {
+        this.loading = false;
+        this.errorMessage = err?.error?.error ?? '试算失败，请检查输入。';
+      },
     });
   }
 
@@ -319,6 +396,20 @@ export class AppComponent implements OnInit {
 
   statusText(s: string): string {
     return { SIMULATED: '试算', CONFIRMED: '已确认', PAID_SIMULATED: '模拟已付' }[s] ?? s;
+  }
+
+  reasonText(code: string): string {
+    return {
+      DEFERRED: '本次暂缓',
+      PLEDGED: '已质押',
+      DISPUTED: '存在争议',
+      NOT_OPEN: '非开放状态',
+      NOT_MEMBER_PAIR: '非协议成员',
+      CCY_NOT_ALLOWED: '币种超范围',
+      CROSS_CCY_NOT_ALLOWED: '禁止跨币种',
+      FX_RATE_MISSING: '缺少汇率',
+      SELF_DEBT: '自我债务',
+    }[code] ?? code;
   }
 
   legClass(l: { isOriginal: boolean; amount: number }): string {

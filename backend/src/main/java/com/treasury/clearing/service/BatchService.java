@@ -38,7 +38,17 @@ public class BatchService {
 
     public record SimulationRequest(LocalDate valuationDate,
                                     List<String> agreementCodes, // null/empty = all active
-                                    String note) {
+                                    String note,
+                                    List<DeferralRequest> deferrals) { // null/empty = none
+    }
+
+    /**
+     * One claim to hold back from this batch only, with the mandatory treasury reason.
+     * Never persisted onto the claim itself — the batch records it as a DEFERRED
+     * exclusion, so the claim re-enters the pool in any later run that does not
+     * select it again.
+     */
+    public record DeferralRequest(String claimId, String reason) {
     }
 
     @Transactional
@@ -50,6 +60,10 @@ public class BatchService {
                         || request.agreementCodes().contains(a.getCode()))
                 .sorted(Comparator.comparing(NettingAgreement::getCode))
                 .toList();
+
+        // Validate before anything is persisted: a bad deferral must fail the whole
+        // request rather than leave a misleading batch behind.
+        Map<String, String> deferrals = validateDeferrals(request.deferrals(), agreements);
 
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         String batchId = "B" + valuationDate.toString().replace("-", "")
@@ -84,7 +98,8 @@ public class BatchService {
                     GroupMode mode = a.isAllowsNetting()
                             ? GroupMode.NET_SAME_CURRENCY
                             : GroupMode.PASS_THROUGH;
-                    PlannedGroup pg = runPocket(a, ccy, mode, agreementClaims, valuationDate, now);
+                    PlannedGroup pg = runPocket(a, ccy, mode, agreementClaims, valuationDate, now,
+                            deferrals);
                     if (pg == null) {
                         continue;
                     }
@@ -103,7 +118,7 @@ public class BatchService {
                             "cross-currency agreement " + a.getCode() + " has no settlement currency");
                 }
                 PlannedGroup pg = runPocket(a, settlement, GroupMode.NET_CROSS_CURRENCY,
-                        agreementClaims, valuationDate, now);
+                        agreementClaims, valuationDate, now, deferrals);
                 if (pg == null) {
                     continue;
                 }
@@ -123,6 +138,48 @@ public class BatchService {
         return batchRepository.save(batch);
     }
 
+    /**
+     * Every deferral must name an existing claim of an agreement covered by this run
+     * and carry a non-blank reason; anything else is rejected so the operator gets an
+     * error instead of a silently misleading batch. Returns claimId -> reason.
+     */
+    private Map<String, String> validateDeferrals(List<DeferralRequest> deferrals,
+                                                  List<NettingAgreement> agreements) {
+        if (deferrals == null || deferrals.isEmpty()) {
+            return Map.of();
+        }
+        Set<String> scopeCodes = new HashSet<>();
+        for (NettingAgreement a : agreements) {
+            scopeCodes.add(a.getCode());
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        for (DeferralRequest d : deferrals) {
+            if (d == null || d.claimId() == null || d.claimId().isBlank()) {
+                throw new IllegalArgumentException("deferral is missing the claim id");
+            }
+            if (d.reason() == null || d.reason().isBlank()) {
+                throw new IllegalArgumentException(
+                        "deferral of claim " + d.claimId() + " requires a reason");
+            }
+            Claim claim = claimRepository.findById(d.claimId())
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "cannot defer unknown claim " + d.claimId()));
+            if (!scopeCodes.contains(claim.getAgreementCode())) {
+                throw new IllegalArgumentException("claim " + d.claimId() + " belongs to agreement "
+                        + claim.getAgreementCode() + ", which is not part of this simulation");
+            }
+            String reason = d.reason().trim();
+            // batch_exclusion.reason_detail is VARCHAR(256).
+            if (reason.length() > 256) {
+                reason = reason.substring(0, 256);
+            }
+            if (out.putIfAbsent(claim.getId(), reason) != null) {
+                throw new IllegalArgumentException("duplicate deferral for claim " + d.claimId());
+            }
+        }
+        return out;
+    }
+
     private int countCashLegs(PlannedGroup pg) {
         int n = 0;
         for (PlannedLeg l : pg.legs()) {
@@ -136,7 +193,7 @@ public class BatchService {
 
     private PlannedGroup runPocket(NettingAgreement a, String groupCurrency, GroupMode mode,
                                    List<Claim> agreementClaims, LocalDate valuationDate,
-                                   OffsetDateTime now) {
+                                   OffsetDateTime now, Map<String, String> deferrals) {
         AgreementSpec spec = new AgreementSpec(a.getCode(), a.getName(), a.isAllowsNetting(),
                 a.isCrossCurrency(), new HashSet<>(a.getMembers()), new HashSet<>(a.getCurrencies()),
                 groupCurrency, a.getRoundingBearerCode());
@@ -150,7 +207,7 @@ public class BatchService {
                 ? a.getFxAsOf()
                 : valuationDate.atTime(23, 59, 59).atOffset(ZoneOffset.UTC);
         PlannedGroup pg = NettingPlanner.plan(spec, plannerClaims, groupCurrency, mode,
-                fxProvider, fxAsOf, a.getFxMargin());
+                fxProvider, fxAsOf, a.getFxMargin(), deferrals);
         if (pg.legs().isEmpty() && pg.exclusions().isEmpty()) {
             return null;
         }

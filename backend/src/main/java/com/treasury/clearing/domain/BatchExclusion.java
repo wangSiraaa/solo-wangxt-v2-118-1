@@ -23,7 +23,9 @@ public class BatchExclusion {
 
     /**
      * PLEDGED, DISPUTED, NOT_OPEN, NOT_MEMBER_PAIR, CCY_NOT_ALLOWED,
-     * CROSS_CCY_NOT_ALLOWED, FX_RATE_MISSING, AGREEMENT_INACTIVE, SELF_DEBT
+     * CROSS_CCY_NOT_ALLOWED, FX_RATE_MISSING, AGREEMENT_INACTIVE, SELF_DEBT,
+     * DEFERRED (held back by treasury for this batch only; reason_detail carries
+     * the operator's reason and the claim itself is never modified)
      */
     @Column(name = "reason_code", nullable = false, length = 32)
     private String reasonCode;

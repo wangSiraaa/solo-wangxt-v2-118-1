@@ -77,7 +77,10 @@ npm start            # http://localhost:4200 ，/api 代理到 8080
    - 允许互抵但禁止跨币种 → 每个币种各自净额；
    - 允许跨币种 → 全部换算到协议结算币种后净额。
 2. **排除**（留痕在 `batch_exclusion`）：非协议成员对、质押 `PLEDGED`、
-   争议 `DISPUTED`、非开放状态、币种超范围、跨币种无汇率（`FX_RATE_MISSING`）。
+   争议 `DISPUTED`、非开放状态、币种超范围、跨币种无汇率（`FX_RATE_MISSING`），
+   以及资金人员按批次勾选的 **本次暂缓**（`DEFERRED`，附填写的暂缓原因）。
+   暂缓只是试算输入：原债权一行不改，后续批次不勾选即重新入池；
+   无效债权编号或超出本次协议范围的暂缓选择会让整个请求报错，不产生批次。
 3. **净额**：每笔债权换算后在债务方形成应付切片、债权方形成应收切片；
    每个法人 `净头寸 = Σ应付 − Σ应收`。净付方/净收方之间贪心匹配产生
    分层面严格平衡的实付腿。
@@ -101,7 +104,7 @@ npm start            # http://localhost:4200 ，/api 代理到 8080
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/entities` `/api/agreements` `/api/claims` `/api/fx-rates` | 主数据 |
-| POST | `/api/batches/simulate` | 生成试算批次（不动债权） |
+| POST | `/api/batches/simulate` | 生成试算批次（不动债权）；可选 `deferrals:[{claimId,reason}]` 本次暂缓个别债权 |
 | GET | `/api/batches` `/api/batches/{id}` | 批次列表 / 详情（含腿、逐笔追溯、排除） |
 | POST | `/api/batches/{id}/confirm` | 确认方案 |
 | POST | `/api/batches/{id}/pay-simulated` | 模拟付款 |
@@ -120,11 +123,15 @@ claim · fx_rate · netting_batch · batch_group · batch_leg · leg_item · bat
 cd backend && ./mvnw clean test
 ```
 
-- `NettingPlannerTest`（10 个）：三方环缩减笔数、闭合环零实付但保留发票追溯、
+- `NettingPlannerTest`（13 个）：三方环缩减笔数、闭合环零实付但保留发票追溯、
   禁止互抵保留原债、质押/争议/非成员/币种排除、跨币种汇率-时点-尾差、
-  逆汇率、缺汇率单独排除，以及 **200 组随机账册** 下
+  逆汇率、缺汇率单独排除、**本次暂缓（净额/禁止互抵/跨币种口袋三态）**，以及
+  **200 组随机账册** 下
   “分层面零和 + 每张发票两侧恰好被追溯一次”的不变量；
 - `ClearingApplicationTests`（Spring 全栈）：在演示数据上验证
   `NA-CNY` 缩减、`NA-NOFF` 保留、`NA-XCCY` 尾差、
   确认后原债权状态变化、pass-through 债权仍开放、
-  模拟付款打标、重复确认冲突。
+  模拟付款打标、重复确认冲突；以及**批次级暂缓**：
+  暂缓发票进入带原因的 `DEFERRED` 排除、金额与腿随之变化、
+  原债权状态不变、再次试算不勾选即重新入池、
+  确认只结算实际入池债权、无效/跨协议/空原因暂缓返回 409 且不留批次。
