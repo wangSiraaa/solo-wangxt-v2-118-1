@@ -302,6 +302,104 @@ class NettingPlannerTest {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Batch-scoped deferral: held-out claims leave an auditable DEFERRED
+    // exclusion and never enter net amounts, legs or invoice traces; the
+    // choice is purely an input of this one plan() call.
+    // ------------------------------------------------------------------
+    @Test
+    void deferredOpenClaimIsExcludedWithReasonAndDoesNotNet() {
+        // Same ring as the first test, but the 1000 invoice is held out pending its
+        // voucher: only B->C 600 and C->A 400 remain -> B funds C 200 and A 400.
+        PlannedGroup g = NettingPlanner.plan(
+                spec(true, false, "A", "B", "C"),
+                List.of(
+                        claim("c1", "A", "B", "1000.00"),
+                        claim("c2", "B", "C", "600.00"),
+                        claim("c3", "C", "A", "400.00")),
+                "CNY", GroupMode.NET_SAME_CURRENCY,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("c1", "凭证尚未办妥"), Set.of("c1"));
+
+        PlannedExclusion ex = g.exclusions().stream()
+                .filter(e -> e.reasonCode().equals("DEFERRED")).findFirst().orElseThrow();
+        assertThat(ex.claimId()).isEqualTo("c1");
+        assertThat(ex.amount()).isEqualByComparingTo("1000.00");
+        assertThat(ex.currency()).isEqualTo("CNY");
+        assertThat(ex.reasonDetail()).contains("凭证尚未办妥");
+        assertThat(g.originalLegCount()).isEqualTo(2);
+        assertThat(g.grossAmount()).isEqualByComparingTo("1000.00");
+        assertThat(cashLegCount(g)).isEqualTo(2);
+        assertThat(cashAmount(g, "B", "C")).isEqualByComparingTo("200.00");
+        assertThat(cashAmount(g, "B", "A")).isEqualByComparingTo("400.00");
+        assertThat(g.netAmount()).isEqualByComparingTo("600.00");
+        // No leg item traces back to the deferred invoice.
+        assertThat(g.legs().stream().flatMap(l -> l.items().stream())
+                .noneMatch(i -> i.claimId().equals("c1"))).isTrue();
+    }
+
+    @Test
+    void withoutDeferralTheSameClaimPoolsNormallyAgain() {
+        List<PlannerClaim> claims = List.of(
+                claim("c1", "A", "B", "1000.00"),
+                claim("c2", "B", "C", "600.00"),
+                claim("c3", "C", "A", "400.00"));
+        PlannedGroup deferred = NettingPlanner.plan(
+                spec(true, false, "A", "B", "C"), claims, "CNY", GroupMode.NET_SAME_CURRENCY,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("c1", "暂缓一次"), Set.of("c1"));
+        // A fresh plan call without the deferral input pools c1 again: full ring result.
+        PlannedGroup replanned = NettingPlanner.plan(
+                spec(true, false, "A", "B", "C"), claims, "CNY", GroupMode.NET_SAME_CURRENCY,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null);
+
+        assertThat(deferred.exclusions()).extracting(PlannedExclusion::reasonCode).contains("DEFERRED");
+        assertThat(replanned.exclusions()).isEmpty();
+        assertThat(cashLegCount(replanned)).isEqualTo(2);
+        assertThat(replanned.grossAmount()).isEqualByComparingTo("2000.00");
+        assertThat(replanned.netAmount()).isEqualByComparingTo("600.00");
+    }
+
+    @Test
+    void deferredClaimUnderPassThroughAgreementIsNotKeptAsOriginalDebt() {
+        // Set-off forbidden: non-deferred debts survive 1:1, the deferred one is held
+        // out entirely (no original leg, one DEFERRED exclusion).
+        PlannedGroup g = NettingPlanner.plan(
+                spec(false, false, "A", "B", "C"),
+                List.of(
+                        claim("c1", "A", "B", "500.00"),
+                        claim("c2", "B", "C", "500.00"),
+                        claim("c3", "C", "A", "500.00")),
+                "CNY", GroupMode.PASS_THROUGH,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of("c2", "发票待补开"), Set.of("c2"));
+
+        assertThat(g.passThrough()).isTrue();
+        assertThat(g.legs()).hasSize(2);
+        assertThat(g.legs()).extracting(l -> l.items().get(0).claimId())
+                .containsExactly("c1", "c3");
+        assertThat(g.exclusions()).extracting(PlannedExclusion::reasonCode)
+                .containsExactly("DEFERRED");
+        assertThat(g.grossAmount()).isEqualByComparingTo("1000.00");
+    }
+
+    @Test
+    void deferredClaimRoutedToAnotherCurrencyPocketIsSilentlySkipped() {
+        // Same-currency agreement: the USD deferral belongs to the USD pocket and must
+        // not produce a CROSS_CCY_NOT_ALLOWED duplicate in the CNY pocket.
+        PlannedGroup g = NettingPlanner.plan(
+                spec(true, false, "A", "B"),
+                List.of(
+                        claim("c1", "A", "B", "100.00"),
+                        claim("u1", "B", "A", "100.00", "USD", ClaimStatus.OPEN)),
+                "CNY", GroupMode.NET_SAME_CURRENCY,
+                fixedFx(Map.of()), OffsetDateTime.parse("2026-09-30T09:00:00Z"), null,
+                Map.of(), Set.of("u1"));
+
+        assertThat(g.exclusions()).isEmpty();
+        assertThat(g.originalLegCount()).isEqualTo(1);
+    }
+
     @Test
     void missingAgreementRateOnCrossCcyDoesNotLeakAsZero() {
         // A missing FX rate excludes the claim rather than converting it to zero.

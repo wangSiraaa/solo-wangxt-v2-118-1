@@ -11,6 +11,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Pure-Java multilateral netting engine. All monetary math is {@link BigDecimal},
@@ -87,6 +88,28 @@ public final class NettingPlanner {
                                     FxRateProvider fxProvider,
                                     OffsetDateTime fxAsOf,
                                     BigDecimal fxMargin) {
+        return plan(spec, claims, groupCurrency, mode, fxProvider, fxAsOf, fxMargin, Map.of(), Set.of());
+    }
+
+    /**
+     * @param deferredReasons batch-scoped "held out this run" choices routed to this
+     *                        pocket: claim id -> the treasurer's reason. They are
+     *                        excluded as DEFERRED before any other rule is evaluated.
+     * @param deferredElsewhere ids deferred by the user but belonging to a different
+     *                          pocket (same-currency agreements run one pocket per
+     *                          currency): skipped silently here so they are neither
+     *                          included nor double-counted with a structural reason.
+     *                          Nothing here is written back to the original claim.
+     */
+    public static PlannedGroup plan(AgreementSpec spec,
+                                    List<PlannerClaim> claims,
+                                    String groupCurrency,
+                                    GroupMode mode,
+                                    FxRateProvider fxProvider,
+                                    OffsetDateTime fxAsOf,
+                                    BigDecimal fxMargin,
+                                    Map<String, String> deferredReasons,
+                                    Set<String> deferredElsewhere) {
         boolean passThrough = mode == GroupMode.PASS_THROUGH;
 
         List<PlannedExclusion> exclusions = new ArrayList<>();
@@ -102,10 +125,22 @@ public final class NettingPlanner {
                 .toList();
 
         for (PlannerClaim c : ordered) {
+            // Batch-scoped deferral wins over every structural rule: the claim is a
+            // legitimate open member claim, simply held out of THIS run by the user.
+            if (deferredReasons.containsKey(c.id())) {
+                exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), c.amount(), c.currency(),
+                        "DEFERRED", "本次暂缓：" + deferredReasons.get(c.id())));
+                continue;
+            }
+            // Deferred but routed to another currency pocket: neither a DEFERRED row
+            // nor a structural exclusion belongs here.
+            if (deferredElsewhere.contains(c.id())) {
+                continue;
+            }
             String reason = exclusionReason(spec, c, groupCurrency, mode);
             if (reason != null) {
-                exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), reason,
-                        exclusionDetail(spec, c, groupCurrency, mode, reason)));
+                exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), c.amount(), c.currency(),
+                        reason, exclusionDetail(spec, c, groupCurrency, mode, reason)));
                 continue;
             }
             if (passThrough) {
@@ -122,8 +157,8 @@ public final class NettingPlanner {
             if (!c.currency().equals(groupCurrency)) {
                 FxQuote quote = fxProvider.quote(c.currency(), groupCurrency, fxAsOf).orElse(null);
                 if (quote == null) {
-                    exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), "FX_RATE_MISSING",
-                            c.currency() + "->" + groupCurrency + " at " + fxAsOf));
+                    exclusions.add(new PlannedExclusion(c.id(), c.invoiceNo(), c.amount(), c.currency(),
+                            "FX_RATE_MISSING", c.currency() + "->" + groupCurrency + " at " + fxAsOf));
                     continue;
                 }
                 rate = quote.rate();
@@ -151,7 +186,8 @@ public final class NettingPlanner {
         }
 
         if (passThrough) {
-            return passThroughGroup(spec, groupCurrency, ordered, exclusions, gross, originalLegCount);
+            return passThroughGroup(spec, groupCurrency, ordered, exclusions, deferredElsewhere,
+                    gross, originalLegCount);
         }
 
         // ---- slice pools ------------------------------------------------------
@@ -406,11 +442,13 @@ public final class NettingPlanner {
     private static PlannedGroup passThroughGroup(AgreementSpec spec, String groupCurrency,
                                                  List<PlannerClaim> ordered,
                                                  List<PlannedExclusion> exclusions,
+                                                 Set<String> skippedIds,
                                                  BigDecimal gross, int originalLegCount) {
         List<PlannedLeg> legs = new ArrayList<>();
         int seq = 0;
         for (PlannerClaim c : ordered) {
-            if (exclusions.stream().anyMatch(e -> e.claimId().equals(c.id()))) {
+            if (skippedIds.contains(c.id())
+                    || exclusions.stream().anyMatch(e -> e.claimId().equals(c.id()))) {
                 continue;
             }
             PlannedItem item = new PlannedItem(c.id(), c.invoiceNo(), c.debtorCode(), c.creditorCode(),
@@ -466,6 +504,7 @@ public final class NettingPlanner {
                     "agreement forbids cross-currency set-off (" + c.currency() + " vs " + groupCurrency + ")";
             case "NOT_OPEN" -> "claim status is " + c.status();
             case "SELF_DEBT" -> "debtor and creditor are the same entity";
+            case "DEFERRED" -> "held out of this batch at the treasurer's request";
             default -> null;
         };
     }

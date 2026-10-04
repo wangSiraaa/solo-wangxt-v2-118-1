@@ -2,7 +2,11 @@ package com.treasury.clearing;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -14,6 +18,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.LocalDate;
+import java.util.Map;
 
 /**
  * Full-stack acceptance on the seeded dataset:
@@ -25,13 +30,91 @@ import java.time.LocalDate;
  */
 @SpringBootTest
 @AutoConfigureMockMvc
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ClearingApplicationTests {
 
     @Autowired
     private MockMvc mockMvc;
     private final ObjectMapper json = new ObjectMapper();
 
+    // ------------------------------------------------------------------
+    // Batch-scoped deferral acceptance (run before the lifecycle test,
+    // which settles the NA-CNY ring claims on confirm).
+    // ------------------------------------------------------------------
+
     @Test
+    @Order(1)
+    void deferredOpenInvoiceIsExcludedWithReasonAndAmountsChange() throws Exception {
+        // Hold one open NA-CNY invoice out of this batch: 600 B->C. The remaining
+        // five ring invoices must produce different totals and one DEFERRED row.
+        JsonNode sim = simulate(LocalDate.of(2026, 9, 30), Map.of("agreementCodes",
+                json.createArrayNode().add("NA-CNY")),
+                java.util.List.of(Map.of("claimId", "CLM-R1-002", "reason", "凭证尚未办妥，暂缓入池")));
+
+        JsonNode cny = group(sim, "NA-CNY");
+        assertThat(cny.get("originalLegCount").asInt()).isEqualTo(5);
+        assertThat(cny.get("grossAmount").decimalValue()).isEqualByComparingTo("2000.00");
+        // Ring without B->C 600: positions A +600, B -200, C -400 -> net 1000 (was 600).
+        assertThat(cny.get("netAmount").decimalValue()).isEqualByComparingTo("1000.00");
+        assertThat(sim.get("excludedClaimCount").asInt()).isEqualTo(3); // pledged + disputed + deferred
+
+        boolean found = false;
+        for (JsonNode ex : cny.get("exclusions")) {
+            if (ex.get("reasonCode").asText().equals("DEFERRED")) {
+                assertThat(ex.get("claimId").asText()).isEqualTo("CLM-R1-002");
+                assertThat(ex.get("invoiceNo").asText()).isEqualTo("INV-B-2001");
+                assertThat(ex.get("amount").decimalValue()).isEqualByComparingTo("600.00");
+                assertThat(ex.get("currency").asText()).isEqualTo("CNY");
+                assertThat(ex.get("reasonDetail").asText()).contains("凭证尚未办妥");
+                found = true;
+            }
+        }
+        assertThat(found).isTrue();
+        // The deferred invoice has no leg / trace items in this batch.
+        for (JsonNode leg : cny.get("legs")) {
+            for (JsonNode it : leg.get("items")) {
+                assertThat(it.get("claimId").asText()).isNotEqualTo("CLM-R1-002");
+            }
+        }
+        // And the original claim row is untouched.
+        assertThat(findClaim(claims(), "CLM-R1-002").get("status").asText()).isEqualTo("OPEN");
+        assertThat(findClaim(claims(), "CLM-R1-002").get("offsetBatchId").asText()).isEmpty();
+    }
+
+    @Test
+    @Order(2)
+    void sameInvoicePoolsAgainWhenNotDeferredOnNextTrial() throws Exception {
+        JsonNode sim = simulate(LocalDate.of(2026, 9, 30), Map.of("agreementCodes",
+                json.createArrayNode().add("NA-CNY")), java.util.List.of());
+
+        JsonNode cny = group(sim, "NA-CNY");
+        assertThat(cny.get("originalLegCount").asInt()).isEqualTo(6);
+        assertThat(cny.get("grossAmount").decimalValue()).isEqualByComparingTo("2600.00");
+        assertThat(cny.get("netAmount").decimalValue()).isEqualByComparingTo("600.00");
+        assertThat(reasons(cny)).containsExactlyInAnyOrder("PLEDGED", "DISPUTED");
+        assertThat(cashLegs(cny)).isEqualTo(2);
+    }
+
+    @Test
+    @Order(3)
+    void invalidDeferralSelectionsAreRejectedWithoutCreatingABatch() throws Exception {
+        int batchesBefore = batchCount();
+
+        // Unknown claim id.
+        expectSimulateConflict(java.util.List.of(Map.of("claimId", "CLM-DOES-NOT-EXIST", "reason", "x")));
+        // Cross-agreement pick: NA-NOFF claim while only NA-CNY is in scope.
+        expectSimulateConflict(java.util.List.of(
+                Map.of("claimId", "CLM-NF-001", "reason", "x")), "NA-CNY");
+        // Missing reason.
+        expectSimulateConflict(java.util.List.of(
+                Map.of("claimId", "CLM-R1-001", "reason", "  ")), "NA-CNY");
+
+        // All malformed requests aborted before persistence: no misleading batch.
+        assertThat(batchCount()).isEqualTo(batchesBefore);
+    }
+
+    @Test
+    @Order(4)
     void fullAcceptanceScenario() throws Exception {
         JsonNode sim = simulate(LocalDate.of(2026, 9, 30));
 
@@ -129,12 +212,52 @@ class ClearingApplicationTests {
     }
 
     private JsonNode simulate(LocalDate date) throws Exception {
-        var req = json.createObjectNode().put("valuationDate", date.toString());
+        return simulate(date, Map.of(), java.util.List.of());
+    }
+
+    private JsonNode simulate(LocalDate date, Map<String, com.fasterxml.jackson.databind.JsonNode> extra,
+                              java.util.List<Map<String, String>> deferred) throws Exception {
+        var root = json.createObjectNode();
+        root.put("valuationDate", date.toString());
+        extra.forEach(root::set);
+        ArrayNode arr = root.putArray("deferred");
+        for (Map<String, String> d : deferred) {
+            arr.addObject().put("claimId", d.get("claimId")).put("reason", d.get("reason"));
+        }
         return json.readTree(mockMvc.perform(post("/api/batches/simulate")
-                        .contentType("application/json")
-                        .content(json.writeValueAsString(req)))
+                        .contentType("application/json;charset=UTF-8")
+                        .content(json.writeValueAsString(root).getBytes(java.nio.charset.StandardCharsets.UTF_8)))
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString());
+    }
+
+    private void expectSimulateConflict(java.util.List<Map<String, String>> deferred,
+                                        String... agreementCodes) throws Exception {
+        var root = json.createObjectNode();
+        root.put("valuationDate", "2026-09-30");
+        if (agreementCodes.length > 0) {
+            ArrayNode codes = root.putArray("agreementCodes");
+            for (String code : agreementCodes) {
+                codes.add(code);
+            }
+        }
+        ArrayNode arr = root.putArray("deferred");
+        for (Map<String, String> d : deferred) {
+            arr.addObject().put("claimId", d.get("claimId")).put("reason", d.get("reason"));
+        }
+        mockMvc.perform(post("/api/batches/simulate")
+                        .contentType("application/json;charset=UTF-8")
+                        .content(json.writeValueAsString(root).getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                .andExpect(status().isConflict());
+    }
+
+    private JsonNode listBatchesJson() throws Exception {
+        return json.readTree(mockMvc.perform(get("/api/batches"))
+                .andReturn().getResponse().getContentAsString());
+    }
+
+    private int batchCount() throws Exception {
+        return listBatchesJson().size();
     }
 
     private JsonNode postJson(String path) throws Exception {

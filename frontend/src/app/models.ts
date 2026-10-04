@@ -65,8 +65,16 @@ export interface Exclusion {
   id: string;
   claimId: string;
   invoiceNo: string;
+  amount?: number | '';
+  currency?: string;
   reasonCode: string;
   reasonDetail: string;
+}
+
+/** Batch-scoped "held out this run" choice; never persisted on the claim itself. */
+export interface DeferredClaim {
+  claimId: string;
+  reason: string;
 }
 
 export interface BatchLeg {

@@ -122,16 +122,25 @@ public class ClearingController {
 
     // ---------------- batches ----------------
 
+    public record SimulateDeferred(String claimId, String reason) {
+    }
+
     public record SimulateRequest(LocalDate valuationDate,
                                   List<String> agreementCodes,
-                                  String note) {
+                                  String note,
+                                  List<SimulateDeferred> deferred) {
     }
 
     @PostMapping("/batches/simulate")
     @ResponseStatus(HttpStatus.CREATED)
     public Map<String, Object> simulate(@Valid @RequestBody SimulateRequest request) {
+        List<BatchService.DeferredClaim> deferred = request.deferred() == null
+                ? List.of()
+                : request.deferred().stream()
+                        .map(d -> new BatchService.DeferredClaim(d.claimId(), d.reason()))
+                        .toList();
         NettingBatch batch = batchService.simulate(new SimulationRequest(
-                request.valuationDate(), request.agreementCodes(), request.note()));
+                request.valuationDate(), request.agreementCodes(), request.note(), deferred));
         return toBatchJson(batchService.getBatch(batch.getId()));
     }
 
@@ -231,6 +240,8 @@ public class ClearingController {
                 em.put("id", ex.getId());
                 em.put("claimId", ex.getClaimId());
                 em.put("invoiceNo", nv(ex.getInvoiceNo()));
+                em.put("amount", ex.getAmount() == null ? "" : ex.getAmount().setScale(2, java.math.RoundingMode.HALF_UP));
+                em.put("currency", nv(ex.getCurrency()));
                 em.put("reasonCode", ex.getReasonCode());
                 em.put("reasonDetail", nv(ex.getReasonDetail()));
                 return em;

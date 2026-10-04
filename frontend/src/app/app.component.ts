@@ -1,8 +1,9 @@
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { HttpErrorResponse } from '@angular/common/http';
 import { ClearingApiService } from './api.service';
-import { Agreement, Batch, BatchGroup, Claim, LegalEntity } from './models';
+import { Agreement, Batch, BatchGroup, Claim, DeferredClaim, Exclusion, LegalEntity } from './models';
 import { DebtGraphComponent, SelectedEdge } from './components/debt-graph.component';
 import { TracePanelComponent } from './components/trace-panel.component';
 import { BatchSummaryComponent } from './components/batch-summary.component';
@@ -45,6 +46,54 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
             {{ loading ? '试算中…' : '生成试算方案（不改动债权）' }}
           </button>
         </div>
+
+        <div class="sim-error" *ngIf="simError">{{ simError }}</div>
+
+        <!-- 本次暂缓：只作用于即将生成的这一个批次，原债权状态不会被修改 -->
+        <div class="defer-box" *ngIf="deferrableClaims.length">
+          <div class="defer-head">
+            <label>
+              <input type="checkbox" [ngModel]="allDeferred"
+                     (ngModelChange)="toggleAllDeferred($event)">
+              <b>本次暂缓</b>
+            </label>
+            <span class="muted">
+              已选 {{ deferredMap.size }} 张 · 暂缓仅属于本次试算批次，不改动原债权状态；
+              下次不勾选仍可正常入池
+            </span>
+          </div>
+          <table class="defer-table">
+            <thead>
+            <tr>
+              <th class="ck"></th><th>发票</th><th>债务方 → 债权方</th>
+              <th class="num">金额</th><th>暂缓原因（勾选后必填）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr *ngFor="let c of deferrableClaims"
+                [class.deferred]="isDeferred(c.id)">
+              <td class="ck">
+                <input type="checkbox" [checked]="isDeferred(c.id)"
+                       (change)="toggleDeferred(c.id)">
+              </td>
+              <td>
+                <div>{{ c.invoiceNo }}</div>
+                <div class="muted">{{ c.id }} · {{ c.agreementCode }}</div>
+              </td>
+              <td>{{ c.debtorCode }} → {{ c.creditorCode }}</td>
+              <td class="num">{{ money(c.amount) }} {{ c.currency }}</td>
+              <td>
+                <input class="reason-input"
+                       [placeholder]="isDeferred(c.id) ? '请填写暂缓原因，如：凭证尚未办妥' : '勾选后填写原因'"
+                       [disabled]="!isDeferred(c.id)"
+                       [ngModel]="deferredMap.get(c.id) ?? ''"
+                       (ngModelChange)="setDeferReason(c.id, $event)">
+              </td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+
         <div class="muted hint" *ngIf="selectedAgreementObj() as a">
           当前协议：成员 {{ a.members.join('、') || '—' }}；
           币种 {{ a.currencies.join('、') || '不限' }}；
@@ -154,16 +203,28 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
 
           <!-- 排除清单 -->
           <section class="panel" *ngIf="g.exclusions.length">
-            <h3 class="bad">排除的债权（不参与本次清算）</h3>
+            <h3 class="bad">
+              {{ deferredExclusions(g).length
+                  ? '排除/暂缓的债权（不参与本次清算，净额与发票追溯均不含它们）'
+                  : '排除的债权（不参与本次清算）' }}
+            </h3>
             <table>
               <thead>
-              <tr><th>发票</th><th>债权</th><th>原因码</th><th>说明</th></tr>
+              <tr>
+                <th>发票</th><th>债权</th><th class="num">原始金额</th>
+                <th>原因码</th><th>说明</th>
+              </tr>
               </thead>
               <tbody>
-              <tr *ngFor="let ex of g.exclusions">
+              <tr *ngFor="let ex of g.exclusions" [class.deferred-row]="ex.reasonCode === 'DEFERRED'">
                 <td>{{ ex.invoiceNo }}</td>
                 <td>{{ ex.claimId }}</td>
-                <td><span class="tag DISPUTED">{{ ex.reasonCode }}</span></td>
+                <td class="num">{{ exclusionAmount(ex) }}</td>
+                <td>
+                  <span class="tag" [class]="ex.reasonCode === 'DEFERRED' ? 'DEFERRED' : 'DISPUTED'">
+                    {{ reasonText(ex.reasonCode) }}
+                  </span>
+                </td>
                 <td class="muted">{{ ex.reasonDetail }}</td>
               </tr>
               </tbody>
@@ -202,8 +263,27 @@ import { BatchSummaryComponent } from './components/batch-summary.component';
     .tag.CASH { color: #7dd3fc; border-color: #38bdf8; }
     .tag.MEMO { color: #c4b5fd; border-color: #a78bfa; }
     .tag.LEGORIG { color: #cbd5e1; border-color: #94a3b8; }
+    .tag.DEFERRED { color: #fcd34d; border-color: #fbbf24; }
     .bad { color: var(--bad); }
     .foot { margin-top: 20px; }
+
+    .sim-error {
+      margin-top: 10px; padding: 8px 12px; border-radius: 6px;
+      background: rgba(248,113,113,.12); border: 1px solid #f87171;
+      color: #fca5a5; font-size: 13px;
+    }
+    .defer-box {
+      margin-top: 12px; border: 1px dashed #fbbf24; border-radius: 8px;
+      padding: 10px 12px; background: rgba(251,191,36,.05);
+    }
+    .defer-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+    .defer-head label { display: flex; align-items: center; gap: 6px; color: #fcd34d; font-size: 13px; }
+    .defer-table { font-size: 12.5px; }
+    .defer-table th, .defer-table td { padding: 5px 8px; }
+    .defer-table .ck { width: 28px; text-align: center; }
+    .defer-table tr.deferred { background: rgba(251,191,36,.08); }
+    .reason-input { width: 100%; min-width: 260px; }
+    tr.deferred-row { background: rgba(251,191,36,.07); }
   `],
 })
 export class AppComponent implements OnInit {
@@ -217,6 +297,14 @@ export class AppComponent implements OnInit {
   note = '';
   loading = false;
   busy = false;
+  simError = '';
+
+  /**
+   * Batch-scoped deferral choices for the next simulation: claim id -> reason.
+   * The map is never written back to a claim and is reset after each run, so a
+   * later simulation without an entry pools the invoice normally again.
+   */
+  readonly deferredMap = new Map<string, string>();
 
   current: Batch | null = null;
   activeGroupId = '';
@@ -237,6 +325,57 @@ export class AppComponent implements OnInit {
 
   onAgreementChange(): void {
     this.selectedEdge = null;
+    this.simError = '';
+    this.deferredMap.clear();
+  }
+
+  /**
+   * Claims available for "hold out this run": OPEN invoices of the currently
+   * selected agreement (or all agreements). Ineligible claims are not tickable
+   * here and keep producing their normal exclusion rows instead.
+   */
+  get deferrableClaims(): Claim[] {
+    const inScope = this.selectedAgreement
+      ? this.claims.filter((c) => c.agreementCode === this.selectedAgreement)
+      : this.claims;
+    return inScope
+      .filter((c) => c.status === 'OPEN' && !c.offsetBatchId)
+      .slice()
+      .sort((a, b) =>
+        a.agreementCode.localeCompare(b.agreementCode) ||
+        (a.invoiceNo || '').localeCompare(b.invoiceNo || ''));
+  }
+
+  get allDeferred(): boolean {
+    return this.deferrableClaims.length > 0
+      && this.deferrableClaims.every((c) => this.deferredMap.has(c.id));
+  }
+
+  isDeferred(claimId: string): boolean {
+    return this.deferredMap.has(claimId);
+  }
+
+  toggleDeferred(claimId: string): void {
+    if (this.deferredMap.has(claimId)) {
+      this.deferredMap.delete(claimId);
+    } else {
+      this.deferredMap.set(claimId, '');
+    }
+    this.simError = '';
+  }
+
+  toggleAllDeferred(on: boolean): void {
+    for (const c of this.deferrableClaims) {
+      if (on) {
+        this.deferredMap.set(c.id, this.deferredMap.get(c.id) ?? '');
+      } else {
+        this.deferredMap.delete(c.id);
+      }
+    }
+  }
+
+  setDeferReason(claimId: string, reason: string): void {
+    this.deferredMap.set(claimId, reason);
   }
 
   get activeGroup(): BatchGroup | null {
@@ -251,15 +390,30 @@ export class AppComponent implements OnInit {
   }
 
   runSimulation(): void {
+    const missingReason = [...this.deferredMap.entries()].find(([, reason]) => !reason.trim());
+    if (missingReason) {
+      this.simError = '已勾选为“本次暂缓”的债权必须填写原因：' + missingReason[0];
+      return;
+    }
+    const deferred: DeferredClaim[] = [...this.deferredMap.entries()]
+      .map(([claimId, reason]) => ({ claimId, reason: reason.trim() }));
+
     this.loading = true;
+    this.simError = '';
     const codes = this.selectedAgreement ? [this.selectedAgreement] : [];
-    this.api.simulate(this.valuationDate, codes, this.note).subscribe({
+    this.api.simulate(this.valuationDate, codes, this.note, deferred).subscribe({
       next: (b) => {
         this.loading = false;
+        // The choice belongs to this batch only; a fresh run starts un-checked.
+        this.deferredMap.clear();
         this.batches = [b, ...this.batches];
         this.openBatch(b.id);
       },
-      error: () => (this.loading = false),
+      error: (err: HttpErrorResponse) => {
+        this.loading = false;
+        this.simError = '试算未生成批次：'
+          + (err?.error?.error || err?.message || '请求失败');
+      },
     });
   }
 
@@ -327,6 +481,23 @@ export class AppComponent implements OnInit {
 
   legText(l: { isOriginal: boolean; amount: number }): string {
     return l.isOriginal ? '原债保留' : l.amount === 0 ? '抵销' : '实付';
+  }
+
+  deferredExclusions(g: BatchGroup) {
+    return g.exclusions.filter((ex) => ex.reasonCode === 'DEFERRED');
+  }
+
+  reasonText(code: string): string {
+    if (code === 'DEFERRED') {
+      return '本次暂缓';
+    }
+    return code;
+  }
+
+  exclusionAmount(ex: Exclusion): string {
+    return ex.amount !== '' && ex.amount != null
+      ? `${this.money(ex.amount as number)} ${ex.currency ?? ''}`.trim()
+      : '—';
   }
 
   money(v: number): string {

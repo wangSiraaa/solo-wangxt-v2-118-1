@@ -11,6 +11,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Orchestrates trial runs: groups claims by protocol pocket ((agreement, currency)),
@@ -36,9 +37,21 @@ public class BatchService {
         this.fxProvider = fxProvider;
     }
 
+    /**
+     * One batch-scoped deferral choice: this claim is held out of the trial with
+     * a mandatory reason. The choice affects only this batch; the original claim
+     * status is never changed and a later run without the choice pools it again.
+     */
+    public record DeferredClaim(String claimId, String reason) {
+    }
+
     public record SimulationRequest(LocalDate valuationDate,
                                     List<String> agreementCodes, // null/empty = all active
-                                    String note) {
+                                    String note,
+                                    List<DeferredClaim> deferred) {
+        public SimulationRequest(LocalDate valuationDate, List<String> agreementCodes, String note) {
+            this(valuationDate, agreementCodes, note, List.of());
+        }
     }
 
     @Transactional
@@ -50,6 +63,21 @@ public class BatchService {
                         || request.agreementCodes().contains(a.getCode()))
                 .sorted(Comparator.comparing(NettingAgreement::getCode))
                 .toList();
+
+        // Validate every "held out this run" choice before anything is built: a bad
+        // claim id, a cross-agreement / inactive-agreement pick, or a missing reason
+        // must abort the whole request — never silently produce a misleading batch.
+        Set<String> inScopeAgreementCodes = agreements.stream()
+                .map(NettingAgreement::getCode).collect(Collectors.toCollection(LinkedHashSet::new));
+        Map<String, Claim> deferredClaims = validateDeferred(request.deferred(), inScopeAgreementCodes);
+        // claim id -> reason, grouped by the claim's own agreement for pocket routing.
+        Map<String, Map<String, String>> deferredByAgreement = new LinkedHashMap<>();
+        for (DeferredClaim d : safeDeferred(request.deferred())) {
+            Claim c = deferredClaims.get(d.claimId());
+            deferredByAgreement
+                    .computeIfAbsent(c.getAgreementCode(), k -> new LinkedHashMap<>())
+                    .put(d.claimId(), d.reason().trim());
+        }
 
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         String batchId = "B" + valuationDate.toString().replace("-", "")
@@ -80,11 +108,14 @@ public class BatchService {
             }
             if (!a.isAllowsNetting() || !a.isCrossCurrency()) {
                 // Without cross-currency permission every currency is its own pocket.
+                Map<String, String> agreementDeferred =
+                        deferredByAgreement.getOrDefault(a.getCode(), Map.of());
                 for (String ccy : currencies) {
                     GroupMode mode = a.isAllowsNetting()
                             ? GroupMode.NET_SAME_CURRENCY
                             : GroupMode.PASS_THROUGH;
-                    PlannedGroup pg = runPocket(a, ccy, mode, agreementClaims, valuationDate, now);
+                    PlannedGroup pg = runPocket(a, ccy, mode, agreementClaims, valuationDate, now,
+                            deferredForPocket(agreementDeferred, deferredClaims, ccy));
                     if (pg == null) {
                         continue;
                     }
@@ -103,7 +134,8 @@ public class BatchService {
                             "cross-currency agreement " + a.getCode() + " has no settlement currency");
                 }
                 PlannedGroup pg = runPocket(a, settlement, GroupMode.NET_CROSS_CURRENCY,
-                        agreementClaims, valuationDate, now);
+                        agreementClaims, valuationDate, now,
+                        deferredByAgreement.getOrDefault(a.getCode(), Map.of()));
                 if (pg == null) {
                     continue;
                 }
@@ -134,9 +166,67 @@ public class BatchService {
         return n;
     }
 
+    private List<DeferredClaim> safeDeferred(List<DeferredClaim> deferred) {
+        return deferred == null ? List.of() : deferred;
+    }
+
+    /**
+     * Verifies all batch-scoped deferral choices. Returns the resolved claims keyed
+     * by id. Throws {@link IllegalArgumentException} (mapped to HTTP 409) on the
+     * first problem so no batch rows are created for a malformed request.
+     */
+    private Map<String, Claim> validateDeferred(List<DeferredClaim> deferred, Set<String> inScopeAgreementCodes) {
+        Map<String, Claim> resolved = new LinkedHashMap<>();
+        Set<String> seen = new HashSet<>();
+        for (DeferredClaim d : safeDeferred(deferred)) {
+            if (d == null || d.claimId() == null || d.claimId().isBlank()) {
+                throw new IllegalArgumentException("暂缓项缺少债权编号");
+            }
+            String claimId = d.claimId().trim();
+            if (d.reason() == null || d.reason().isBlank()) {
+                throw new IllegalArgumentException("债权 " + claimId + " 标记为本次暂缓时必须填写原因");
+            }
+            if (d.reason().trim().length() > 256) {
+                throw new IllegalArgumentException("债权 " + claimId + " 的暂缓原因超过 256 字");
+            }
+            if (!seen.add(claimId)) {
+                throw new IllegalArgumentException("债权 " + claimId + " 的暂缓选择重复");
+            }
+            Claim claim = claimRepository.findById(claimId)
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "暂缓的债权编号不存在：" + claimId));
+            if (!inScopeAgreementCodes.contains(claim.getAgreementCode())) {
+                throw new IllegalArgumentException(
+                        "债权 " + claimId + " 属于协议 " + claim.getAgreementCode()
+                                + "，不在本次试算选择的协议范围内，不能跨协议暂缓");
+            }
+            if (claim.getStatus() != ClaimStatus.OPEN || claim.getOffsetBatchId() != null) {
+                throw new IllegalArgumentException(
+                        "债权 " + claimId + " 当前状态为 " + claim.getStatus()
+                                + "，只有尚未被抵销的开放债权可以本次暂缓");
+            }
+            resolved.put(claimId, claim);
+        }
+        return resolved;
+    }
+
+    /** Same-currency pockets only receive deferrals whose claim is denominated in that currency. */
+    private Map<String, String> deferredForPocket(Map<String, String> agreementDeferred,
+                                                  Map<String, Claim> deferredClaims,
+                                                  String pocketCurrency) {
+        Map<String, String> pocket = new LinkedHashMap<>();
+        agreementDeferred.forEach((claimId, reason) -> {
+            Claim c = deferredClaims.get(claimId);
+            if (c != null && c.getCurrency().equals(pocketCurrency)) {
+                pocket.put(claimId, reason);
+            }
+        });
+        return pocket;
+    }
+
     private PlannedGroup runPocket(NettingAgreement a, String groupCurrency, GroupMode mode,
                                    List<Claim> agreementClaims, LocalDate valuationDate,
-                                   OffsetDateTime now) {
+                                   OffsetDateTime now, Map<String, String> deferredReasons) {
         AgreementSpec spec = new AgreementSpec(a.getCode(), a.getName(), a.isAllowsNetting(),
                 a.isCrossCurrency(), new HashSet<>(a.getMembers()), new HashSet<>(a.getCurrencies()),
                 groupCurrency, a.getRoundingBearerCode());
@@ -150,7 +240,7 @@ public class BatchService {
                 ? a.getFxAsOf()
                 : valuationDate.atTime(23, 59, 59).atOffset(ZoneOffset.UTC);
         PlannedGroup pg = NettingPlanner.plan(spec, plannerClaims, groupCurrency, mode,
-                fxProvider, fxAsOf, a.getFxMargin());
+                fxProvider, fxAsOf, a.getFxMargin(), deferredReasons, deferredReasons.keySet());
         if (pg.legs().isEmpty() && pg.exclusions().isEmpty()) {
             return null;
         }
@@ -187,7 +277,8 @@ public class BatchService {
         int eSeq = 0;
         for (PlannedExclusion ex : pg.exclusions()) {
             group.addExclusion(new BatchExclusion(groupId + "-E" + (++eSeq),
-                    ex.claimId(), ex.invoiceNo(), ex.reasonCode(), ex.reasonDetail()));
+                    ex.claimId(), ex.invoiceNo(), ex.amount(), ex.currency(),
+                    ex.reasonCode(), ex.reasonDetail()));
         }
     }
 

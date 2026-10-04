@@ -3,7 +3,7 @@ import { CommonModule } from '@angular/common';
 import { BatchGroup, Claim, LegItem } from '../models';
 
 export interface SelectedEdge {
-  kind: 'cash' | 'memo' | 'original' | 'excluded';
+  kind: 'cash' | 'memo' | 'original' | 'excluded' | 'deferred';
   payer: string;
   receiver: string;
   amount: number;
@@ -23,8 +23,7 @@ interface NodeView {
 
 interface EdgeView {
   id: string;
-  kind: SelectedEdge['kind'];
-  from: string;
+  kind: SelectedEdge['kind'];  from: string;
   to: string;
   amount: number;
   currency: string;
@@ -58,6 +57,7 @@ interface EdgeView {
           <i class="sw cash"></i> 实付腿
           <i class="sw memo"></i> 抵销(零金额)
           <i class="sw orig"></i> 保留原债
+          <i class="sw deferred"></i> 本次暂缓
           <i class="sw excl"></i> 排除(质押/争议…)
         </span>
       </div>
@@ -79,6 +79,10 @@ interface EdgeView {
           <marker id="arrow-excl" viewBox="0 0 10 10" refX="9" refY="5"
                   markerWidth="7" markerHeight="7" orient="auto">
             <path d="M0,0 L10,5 L0,10 z" fill="#f87171"/>
+          </marker>
+          <marker id="arrow-deferred" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#fbbf24"/>
           </marker>
         </defs>
 
@@ -110,16 +114,22 @@ interface EdgeView {
     .seg button.on { background: #0369a1; border-color: #0284c7; color: #fff; }
     .legend i.sw { display: inline-block; width: 18px; height: 3px; border-radius: 2px; margin: 0 4px 0 12px; vertical-align: middle; }
     .sw.cash { background: #38bdf8; } .sw.memo { background: #a78bfa; }
-    .sw.orig { background: #94a3b8; } .sw.excl { background: #f87171; }
+    .sw.orig { background: #94a3b8; }
+    .sw.deferred { background: #fbbf24; }
+    .sw.excl { background: #f87171; }
     .graph { width: 100%; height: auto; }
     .edge { cursor: pointer; }
     .ln { stroke-width: 2; fill: none; }
     .ln.cash { stroke: #38bdf8; } .ln.memo { stroke: #a78bfa; stroke-dasharray: 6 4; }
-    .ln.orig { stroke: #94a3b8; } .ln.excl { stroke: #f87171; stroke-dasharray: 2 3; }
+    .ln.orig { stroke: #94a3b8; }
+    .ln.deferred { stroke: #fbbf24; stroke-dasharray: 5 3; }
+    .ln.excl { stroke: #f87171; stroke-dasharray: 2 3; }
     .hit { stroke: transparent; stroke-width: 14; }
     .amt { font-size: 11px; font-variant-numeric: tabular-nums; }
     .amt.cash { fill: #7dd3fc; } .amt.memo { fill: #c4b5fd; }
-    .amt.orig { fill: #cbd5e1; } .amt.excl { fill: #fca5a5; }
+    .amt.orig { fill: #cbd5e1; }
+    .amt.deferred { fill: #fcd34d; }
+    .amt.excl { fill: #fca5a5; }
   `],
 })
 export class DebtGraphComponent {
@@ -141,7 +151,8 @@ export class DebtGraphComponent {
 
   markerFor(kind: string): string {
     return { cash: 'url(#arrow-cash)', memo: 'url(#arrow-memo)',
-             original: 'url(#arrow-orig)', excluded: 'url(#arrow-excl)' }[kind] ?? '';
+             original: 'url(#arrow-orig)', deferred: 'url(#arrow-deferred)',
+             excluded: 'url(#arrow-excl)' }[kind] ?? '';
   }
 
   select(e: EdgeView): void {
@@ -181,9 +192,11 @@ export class DebtGraphComponent {
       let k = 0;
       for (const c of this.claims) {
         const ex = excludedByClaim.get(c.id);
-        const kind: SelectedEdge['kind'] = ex ? 'excluded' : 'original';
+        const deferred = ex?.reasonCode === 'DEFERRED';
+        const kind: SelectedEdge['kind'] = deferred ? 'deferred' : ex ? 'excluded' : 'original';
+        const suffix = deferred ? ' 暂缓' : ex ? ' ✕' : '';
         this.edges.push(this.edge(`o${k++}`, kind, c.debtorCode, c.creditorCode,
-          c.amount, c.currency, this.fmt(c.amount, c.currency) + (ex ? ' ✕' : ''),
+          c.amount, c.currency, this.fmt(c.amount, c.currency) + suffix,
           pos, [], c, ex?.reasonCode, ex?.reasonDetail));
       }
     } else {

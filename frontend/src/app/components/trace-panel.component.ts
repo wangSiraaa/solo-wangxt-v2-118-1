@@ -29,7 +29,10 @@ import { SelectedEdge } from './debt-graph.component';
       </div>
 
       <div class="reason" *ngIf="edge.reasonCode">
-        <b class="bad">排除原因：{{ edge.reasonCode }}</b>
+        <b [class.deferred]="edge.reasonCode === 'DEFERRED'"
+           [class.bad]="edge.reasonCode !== 'DEFERRED'">
+          {{ edge.reasonCode === 'DEFERRED' ? '本次暂缓（仅此批次，原债权不变）' : '排除原因：' + edge.reasonCode }}
+        </b>
         <div class="muted">{{ edge.reasonDetail }}</div>
       </div>
 
@@ -89,7 +92,9 @@ import { SelectedEdge } from './debt-graph.component';
     .tag.cash { color:#7dd3fc; border-color:#38bdf8; }
     .tag.memo { color:#c4b5fd; border-color:#a78bfa; }
     .tag.original { color:#cbd5e1; border-color:#94a3b8; }
+    .tag.deferred { color:#fcd34d; border-color:#fbbf24; }
     .tag.excluded, .bad { color:#fca5a5; }
+    .deferred { color:#fcd34d; }
     .tag.PLEDGED, .tag.DISPUTED { color:#fca5a5; border-color:#f87171; }
     .tag.OPEN, .tag.SETTLED { color:#6ee7b7; border-color:#34d399; }
     .reason { background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px 10px; margin-bottom:8px; }
@@ -107,6 +112,7 @@ export class TracePanelComponent {
       cash: '实付腿（净额结算）',
       memo: '抵销备忘录（零金额，纯追溯）',
       original: '保留的原始债务（未抵销）',
+      deferred: '本次暂缓的债权（不参与本批次）',
       excluded: '被排除债权',
     }[this.edge?.kind ?? 'cash'];
   }
